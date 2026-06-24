@@ -1,0 +1,1217 @@
+#!/usr/bin/env python3
+"""
+Security Intelligence Dashboard v1.0
+Enterprise-Grade Honeypot Monitoring & Threat Intelligence Platform
+
+This dashboard provides real-time visualization of honeypot attack data,
+MITRE ATT&CK mapping, anomaly detection, and AI-powered security analysis.
+"""
+
+import streamlit as st
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+from elasticsearch import Elasticsearch
+from datetime import datetime, timedelta
+import requests
+import numpy as np
+import time
+import json
+import os
+import re
+import traceback
+
+# ============================================================================
+# MITRE ATT&CK Framework Integration
+# ============================================================================
+
+MITRE_FILE = "mitre_techniques.json"
+MITRE_URL = "https://raw.githubusercontent.com/mitre/cti/master/enterprise-attack/enterprise-attack.json"
+
+def download_mitre_techniques():
+    """
+    Fetch the latest MITRE ATT&CK techniques from the official CTI repository.
+    Returns a dictionary mapping commands to technique IDs, names, and tactics.
+    """
+    try:
+        response = requests.get(MITRE_URL, timeout=30)
+        if response.status_code == 200:
+            data = response.json()
+            techniques = {}
+            
+            for obj in data.get('objects', []):
+                if obj.get('type') == 'attack-pattern':
+                    technique_id = obj.get('external_references', [{}])[0].get('external_id', '')
+                    if technique_id.startswith('T'):
+                        name = obj.get('name', '')
+                        tactic = 'Unknown'
+                        for phase in obj.get('kill_chain_phases', []):
+                            if phase.get('kill_chain_name') == 'mitre-attack':
+                                tactic = phase.get('phase_name', 'Unknown').replace('-', ' ').title()
+                                break
+                        
+                        keywords = name.lower().split()
+                        for keyword in keywords:
+                            if len(keyword) > 3:
+                                techniques[keyword] = {
+                                    'id': technique_id,
+                                    'name': name,
+                                    'tactic': tactic
+                                }
+                        
+                        techniques[name.lower()] = {
+                            'id': technique_id,
+                            'name': name,
+                            'tactic': tactic
+                        }
+            
+            with open(MITRE_FILE, 'w', encoding='utf-8') as f:
+                json.dump(techniques, f, indent=2, ensure_ascii=False)
+            
+            return techniques, True
+    except Exception as e:
+        st.warning(f"Unable to download MITRE techniques: {e}")
+    
+    return None, False
+
+def get_fallback_techniques():
+    """
+    Local fallback MITRE technique mapping when network download fails.
+    """
+    return {
+        "whoami": {"id": "T1033", "name": "System Owner/User Discovery", "tactic": "Discovery"},
+        "id": {"id": "T1033", "name": "System Owner/User Discovery", "tactic": "Discovery"},
+        "uname": {"id": "T1082", "name": "System Information Discovery", "tactic": "Discovery"},
+        "cat /etc/passwd": {"id": "T1087", "name": "Account Discovery", "tactic": "Discovery"},
+        "ls": {"id": "T1083", "name": "File and Directory Discovery", "tactic": "Discovery"},
+        "pwd": {"id": "T1083", "name": "File and Directory Discovery", "tactic": "Discovery"},
+        "echo": {"id": "T1059.004", "name": "Unix Shell", "tactic": "Execution"},
+        "rm": {"id": "T1070.001", "name": "Indicator Removal", "tactic": "Defense Evasion"},
+        "chmod": {"id": "T1222.002", "name": "File Permissions Modification", "tactic": "Defense Evasion"},
+        "passwd": {"id": "T1098", "name": "Account Manipulation", "tactic": "Persistence"},
+        "su": {"id": "T1078", "name": "Valid Accounts", "tactic": "Defense Evasion"},
+        "ssh": {"id": "T1021.004", "name": "SSH", "tactic": "Lateral Movement"},
+        "wget": {"id": "T1105", "name": "Ingress Tool Transfer", "tactic": "Command and Control"},
+        "curl": {"id": "T1105", "name": "Ingress Tool Transfer", "tactic": "Command and Control"},
+        "history": {"id": "T1070.003", "name": "Clear Command History", "tactic": "Defense Evasion"},
+        "crontab": {"id": "T1053.003", "name": "Cron", "tactic": "Persistence"},
+        "systemctl": {"id": "T1053.006", "name": "Systemd Timers", "tactic": "Persistence"},
+        "iptables": {"id": "T1562.004", "name": "Disable/Modify Firewall", "tactic": "Defense Evasion"},
+        "nmap": {"id": "T1046", "name": "Network Service Scanning", "tactic": "Discovery"},
+        "nc": {"id": "T1043", "name": "Commonly Used Port", "tactic": "Command and Control"},
+        "python": {"id": "T1059.006", "name": "Python", "tactic": "Execution"},
+        "bash": {"id": "T1059.004", "name": "Unix Shell", "tactic": "Execution"},
+        "sh": {"id": "T1059.004", "name": "Unix Shell", "tactic": "Execution"},
+        "kill": {"id": "T1489", "name": "Service Stop", "tactic": "Impact"},
+        "pkill": {"id": "T1489", "name": "Service Stop", "tactic": "Impact"},
+        "ufw": {"id": "T1562.004", "name": "Disable/Modify Firewall", "tactic": "Defense Evasion"},
+        "hostnamectl": {"id": "T1614", "name": "System Location Discovery", "tactic": "Discovery"},
+        "git": {"id": "T1105", "name": "Ingress Tool Transfer", "tactic": "Command and Control"},
+        "perl": {"id": "T1059.007", "name": "Perl", "tactic": "Execution"},
+        "service": {"id": "T1053.006", "name": "Systemd Timers", "tactic": "Persistence"},
+        "mkdir": {"id": "T1098.004", "name": "SSH Authorized Keys", "tactic": "Persistence"},
+        "scp": {"id": "T1105", "name": "Ingress Tool Transfer", "tactic": "Command and Control"},
+        "nohup": {"id": "T1059.004", "name": "Unix Shell", "tactic": "Execution"},
+        "screen": {"id": "T1059.004", "name": "Unix Shell", "tactic": "Execution"},
+        "tmux": {"id": "T1059.004", "name": "Unix Shell", "tactic": "Execution"},
+        "vi": {"id": "T1059.004", "name": "Unix Shell", "tactic": "Execution"},
+        "nano": {"id": "T1059.004", "name": "Unix Shell", "tactic": "Execution"},
+        "emacs": {"id": "T1059.004", "name": "Unix Shell", "tactic": "Execution"},
+    }
+
+def load_mitre_techniques(filepath=MITRE_FILE):
+    """
+    Load MITRE techniques from local cache or download from internet.
+    """
+    if os.path.exists(filepath):
+        try:
+            with open(filepath, 'r', encoding='utf-8') as f:
+                techniques = json.load(f)
+                if techniques:
+                    return techniques
+        except:
+            pass
+    
+    with st.spinner("Retrieving MITRE ATT&CK framework from official repository..."):
+        techniques, success = download_mitre_techniques()
+        if success and techniques:
+            st.success(f"Successfully loaded {len(techniques)} MITRE techniques")
+            return techniques
+    
+    st.warning("Using fallback MITRE technique mapping (limited coverage)")
+    return get_fallback_techniques()
+
+def save_mitre_techniques(techniques, filepath=MITRE_FILE):
+    """
+    Persist MITRE technique mappings to local JSON file.
+    """
+    try:
+        with open(filepath, 'w', encoding='utf-8') as f:
+            json.dump(techniques, f, indent=2, ensure_ascii=False)
+        return True
+    except Exception as e:
+        st.error(f"Failed to save MITRE techniques: {e}")
+        return False
+
+MITRE_TECHNIQUES = load_mitre_techniques()
+
+def safe_str(value):
+    """
+    Safely convert any value to string, handling dicts and lists.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, dict):
+        return value.get('command', value.get('input', json.dumps(value)))
+    if isinstance(value, list):
+        return ' '.join(str(x) for x in value)
+    return str(value)
+
+def get_mitre_for_command(command):
+    """
+    Map a command string to its corresponding MITRE ATT&CK technique.
+    Returns None if no match is found.
+    """
+    cmd_str = safe_str(command).strip().lower()
+    if not cmd_str:
+        return None
+    if cmd_str in MITRE_TECHNIQUES:
+        return MITRE_TECHNIQUES[cmd_str]
+    for pattern, technique in MITRE_TECHNIQUES.items():
+        if pattern in cmd_str:
+            return technique
+    return None
+
+def add_mitre_to_df(df):
+    """
+    Enrich DataFrame with MITRE ATT&CK technique mappings.
+    """
+    if df.empty:
+        return df
+    if 'command' not in df.columns:
+        df['command'] = ""
+    df['command'] = df['command'].apply(safe_str)
+    mitre_data = df['command'].apply(get_mitre_for_command)
+    df['mitre_id'] = mitre_data.apply(lambda x: x['id'] if x else None)
+    df['mitre_name'] = mitre_data.apply(lambda x: x['name'] if x else None)
+    df['mitre_tactic'] = mitre_data.apply(lambda x: x['tactic'] if x else None)
+    return df
+
+# ============================================================================
+# Page Configuration & UI Theme
+# ============================================================================
+
+st.set_page_config(
+    page_title="Security Intelligence Dashboard | Threat Monitoring Platform",
+    page_icon="🛡️",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+COLORS = {
+    "primary": "#FF6B6B",
+    "secondary": "#4ECDC4",
+    "success": "#5DFFA6",
+    "warning": "#FFE66D",
+    "danger": "#F25454",
+    "dark": "#2C3E50",
+    "light": "#ECF0F1",
+    "purple": "#9B59B6",
+    "mitre": "#6241EA"
+}
+
+st.markdown(f"""
+<h1 style='text-align: center; color: {COLORS["primary"]};'>
+    🛡️ Security Intelligence Dashboard
+</h1>
+<p style='text-align: center; color: {COLORS["dark"]}; font-size: 18px;'>
+    Enterprise-Grade Honeypot Monitoring · Threat Intelligence · MITRE ATT&CK Framework Integration
+</p>
+<p style='text-align: center; color: #888; font-size: 14px;'>
+    Real-time attack visualization · AI-powered threat analysis · Anomaly detection
+</p>
+<hr>
+""", unsafe_allow_html=True)
+
+@st.cache_resource
+def get_elasticsearch():
+    """
+    Establish connection to Elasticsearch cluster.
+    """
+    return Elasticsearch(["http://10.10.10.10:9200"])
+
+es = get_elasticsearch()
+
+# ============================================================================
+# Threat Intelligence & Anomaly Detection Engine
+# ============================================================================
+
+def ai_analyze_logs(df, ollama_url="http://192.168.157.1:11434"):
+    """
+    Leverage local LLM (Gemma via Ollama) for security analysis and recommendations.
+    """
+    if df.empty:
+        return "No data available for analysis"
+
+    total = len(df)
+    success = len(df[df['eventid'].str.contains('success', case=False, na=False)])
+    failed = len(df[df['eventid'].str.contains('failed|attempt', case=False, na=False)])
+    
+    if 'src_ip' in df.columns and not df['src_ip'].mode().empty:
+        top_ip = df['src_ip'].mode().iloc[0]
+    else:
+        top_ip = "unknown"
+        
+    if 'username' in df.columns and not df['username'].mode().empty:
+        top_user = df['username'].mode().iloc[0]
+    else:
+        top_user = "unknown"
+        
+    if 'password' in df.columns and not df['password'].mode().empty:
+        common_password = df['password'].mode().iloc[0]
+    else:
+        common_password = "unknown"
+        
+    mitre_count = df['mitre_id'].notna().sum() if 'mitre_id' in df.columns else 0
+
+    prompt = f"""You are a security analyst. Analyze these honeypot statistics:
+
+- Total attempts: {total}
+- Successful logins: {success}
+- Failed attempts: {failed}
+- Top attacker IP: {top_ip}
+- Most targeted user: {top_user}
+- Most common password: {common_password}
+- MITRE techniques detected: {mitre_count}
+
+Detect anomalies or unusual behavior.
+Suggest 2-3 specific security recommendations.
+Keep response short and actionable.
+
+ANALYSIS:"""
+
+    try:
+        response = requests.post(
+            f"{ollama_url}/api/generate",
+            json={
+                "model": "gemma3:4b",
+                "prompt": prompt,
+                "stream": False,
+                "options": {"temperature": 0.5, "num_predict": 250}
+            },
+            timeout=240,
+            headers={"Content-Type": "application/json"}
+        )
+        if response.status_code == 200:
+            return response.json().get("response", "No analysis available")
+        else:
+            return f"AI analysis error: HTTP {response.status_code}"
+    except requests.exceptions.Timeout:
+        return "AI analysis timeout. Ollama may be under load."
+    except requests.exceptions.ConnectionError as e:
+        return f"Unable to connect to Ollama: {str(e)[:50]}"
+    except Exception as e:
+        return f"AI analysis unavailable: {str(e)[:50]}"
+
+def detect_anomalies(df):
+    """
+    Identify suspicious patterns and potential security threats in the data.
+    """
+    anomalies = []
+    if df.empty:
+        return anomalies
+    
+    try:
+        df_minute = df.set_index('timestamp').resample('1min').size()
+        if (df_minute > 10).any():
+            anomalies.append("High-velocity attack detected (>10 attempts/minute)")
+    except:
+        pass
+    
+    try:
+        night_attacks = df[df['timestamp'].dt.hour.between(2, 5)]
+        if len(night_attacks) > 20:
+            anomalies.append(f"Unusual nocturnal activity: {len(night_attacks)} attempts between 2AM-5AM")
+    except:
+        pass
+    
+    weak_passwords = ['123456', 'password', 'admin', 'root', 'toor', '123456789', 'qwerty']
+    try:
+        if 'password' in df.columns:
+            found_weak = [p for p in weak_passwords if p in df['password'].astype(str).values]
+            if found_weak:
+                anomalies.append(f"Weak password usage detected: {', '.join(found_weak[:3])}")
+    except:
+        pass
+    
+    try:
+        if 'src_ip' in df.columns:
+            ip_counts = df['src_ip'].value_counts()
+            if not ip_counts.empty and (ip_counts > 50).any():
+                top_ip = ip_counts.index[0]
+                anomalies.append(f"Concentrated attack from single IP: {top_ip} ({ip_counts.iloc[0]} attempts)")
+    except:
+        pass
+    
+    if 'mitre_id' in df.columns:
+        dangerous_mitre = ['T1003', 'T1053.003', 'T1548.001', 'T1070.003']
+        for mitre_id in dangerous_mitre:
+            try:
+                if df['mitre_id'].astype(str).str.contains(mitre_id, na=False).any():
+                    anomalies.append(f"Critical MITRE technique detected: {mitre_id}")
+            except:
+                pass
+    
+    if 'mitre_tactic' in df.columns:
+        try:
+            persist_attempts = df[df['mitre_tactic'] == 'Persistence']
+            if len(persist_attempts) > 0:
+                anomalies.append(f"Persistence mechanism attempts: {len(persist_attempts)} commands detected")
+        except:
+            pass
+    
+    return anomalies
+
+def detect_brute_force(df):
+    """
+    Identify potential brute-force attacks based on IP attempt frequency.
+    """
+    try:
+        if 'src_ip' in df.columns:
+            ip_attempts = df.groupby('src_ip').size().reset_index(name='count')
+            ip_attempts = ip_attempts[ip_attempts['count'] > 10]
+            if not ip_attempts.empty:
+                return ip_attempts
+    except:
+        pass
+    return pd.DataFrame()
+
+# ============================================================================
+# Data Extraction Layer
+# ============================================================================
+
+OPENCANARY_LOGTYPES = {
+    1001: 'opencanary.service.start',
+    2000: 'opencanary.ftp.login',
+    2001: 'opencanary.ftp.command',
+    3000: 'opencanary.http.request',
+    3001: 'opencanary.http.request',
+    4000: 'opencanary.ssh.session.connect',
+    4001: 'opencanary.ssh.version.exchange',
+    4002: 'opencanary.ssh.login.failed',
+    4003: 'opencanary.ssh.command.input',
+    5000: 'opencanary.mysql.login',
+    5001: 'opencanary.mysql.query',
+    6001: 'opencanary.telnet.login',
+    6002: 'opencanary.telnet.command',
+    7001: 'opencanary.mssql.login',
+    8001: 'opencanary.ntp.request',
+    9001: 'opencanary.redis.command',
+    10001: 'opencanary.sip.request',
+    11001: 'opencanary.git.clone',
+    12001: 'opencanary.snmp.request',
+    13001: 'opencanary.ntp.request',
+}
+
+def extract_opencanary_data(src):
+    """
+    Extract relevant fields from OpenCanary log entries.
+    OpenCanary stores credentials in the 'logdata' field with uppercase keys.
+    """
+    username = ""
+    password = ""
+    command = ""
+    eventid = ""
+    src_ip = ""
+    
+    logdata = src.get('logdata', {})
+    
+    if isinstance(logdata, dict):
+        username = logdata.get('USERNAME', '')
+        password = logdata.get('PASSWORD', '')
+        command = logdata.get('CMD', logdata.get('command', ''))
+        
+        local_version = logdata.get('LOCALVERSION', '')
+        remote_version = logdata.get('REMOTEVERSION', '')
+        session = logdata.get('SESSION', '')
+        
+        if remote_version and not command:
+            command = f"SSH client: {remote_version}"
+        elif local_version and not command:
+            command = f"SSH server: {local_version}"
+    
+    logtype = src.get('logtype', 0)
+    eventid = OPENCANARY_LOGTYPES.get(logtype, f'opencanary.unknown.{logtype}')
+    
+    src_ip = src.get('src_host', '')
+    if not src_ip:
+        src_ip = src.get('src_ip', '')
+    
+    dst_host = src.get('dst_host', '')
+    dst_port = src.get('dst_port', '')
+    
+    return username, password, command, eventid, src_ip, dst_host, dst_port
+
+def fetch_logs(hours=24):
+    """
+    Retrieve logs from Elasticsearch for the specified time window.
+    Handles both Cowrie and OpenCanary data formats.
+    """
+    query = {
+        "size": 10000,
+        "query": {"range": {"@timestamp": {"gte": f"now-{hours}h"}}},
+        "sort": [{"@timestamp": "desc"}]
+    }
+    
+    try:
+        res = es.search(index="filebeat-*,opencanary-*", body=query)
+        data = []
+        
+        for hit in res['hits']['hits']:
+            src = hit['_source']
+            index = hit.get('_index', '')
+            honeypot_type = 'cowrie' if 'cowrie' in index else 'opencanary'
+            
+            timestamp = src.get('@timestamp')
+            username = ""
+            password = ""
+            command = ""
+            eventid = ""
+            src_ip = ""
+            
+            if honeypot_type == 'opencanary':
+                username, password, command, eventid, src_ip, dst_host, dst_port = extract_opencanary_data(src)
+                
+                if not username:
+                    username = src.get('username', '')
+                if not password:
+                    password = src.get('password', '')
+                if not command:
+                    command = src.get('command', src.get('input', ''))
+                if not src_ip:
+                    message = src.get('message', '')
+                    if isinstance(message, str):
+                        ip_pattern = r'\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b'
+                        ips = re.findall(ip_pattern, message)
+                        for ip in ips:
+                            if not ip.startswith('127.') and not ip.startswith('0.') and not ip.startswith('255.'):
+                                src_ip = ip
+                                break
+            
+            else:
+                eventid = src.get('eventid', '')
+                username = src.get('username', '')
+                password = src.get('password', '')
+                src_ip = src.get('src_ip', '')
+                
+                if eventid == 'cowrie.command.input':
+                    raw_message = src.get('message', '')
+                    if isinstance(raw_message, str) and raw_message.startswith('CMD: '):
+                        command = raw_message[5:].strip()
+                    elif isinstance(raw_message, str):
+                        command = raw_message.strip()
+                    else:
+                        command = src.get('input', '')
+                else:
+                    command = src.get('input', '')
+            
+            if not command:
+                command = src.get('command', src.get('input', ''))
+            
+            username = str(username) if username else ''
+            password = str(password) if password else ''
+            command = str(command) if command else ''
+            eventid = str(eventid) if eventid else 'unknown'
+            src_ip = str(src_ip) if src_ip else 'Unknown'
+            
+            data.append({
+                'timestamp': timestamp,
+                'eventid': eventid,
+                'src_ip': src_ip,
+                'username': username,
+                'password': password,
+                'command': command,
+                'honeypot_type': honeypot_type
+            })
+        
+        return pd.DataFrame(data)
+    
+    except Exception as e:
+        st.error(f"Data retrieval error: {e}")
+        st.error(traceback.format_exc())
+        return pd.DataFrame()
+
+def calculate_stats(df):
+    """
+    Compute key security metrics from the dataset.
+    """
+    total = len(df)
+    success = len(df[df['eventid'].str.contains('success', case=False, na=False)])
+    failed = len(df[df['eventid'].str.contains('failed|attempt', case=False, na=False)])
+    success_rate = (success / total * 100) if total > 0 else 0
+    unique_ips = df['src_ip'].nunique() if 'src_ip' in df.columns else 0
+    return total, success, failed, success_rate, unique_ips
+
+# ============================================================================
+# Visualization Components
+# ============================================================================
+
+def create_attack_timeline(df):
+    """Generate hourly attack frequency timeline."""
+    if df.empty:
+        return go.Figure()
+    try:
+        df_hourly = df.set_index('timestamp').resample('1h').size().reset_index()
+        df_hourly.columns = ['timestamp', 'count']
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(
+            x=df_hourly['timestamp'], y=df_hourly['count'],
+            mode='lines+markers', name='Attack Volume',
+            line=dict(color=COLORS["primary"], width=3),
+            marker=dict(size=8, color=COLORS["danger"])
+        ))
+        fig.update_layout(
+            title="Attack Timeline",
+            xaxis_title="Time",
+            yaxis_title="Number of Attacks",
+            height=400,
+            template="plotly_white"
+        )
+        return fig
+    except:
+        return go.Figure()
+
+def create_attack_heatmap(df):
+    """Generate day-of-week vs hour attack heatmap."""
+    if df.empty:
+        return go.Figure()
+    try:
+        df_copy = df.copy()
+        df_copy['hour'] = df_copy['timestamp'].dt.hour
+        df_copy['day'] = df_copy['timestamp'].dt.day_name()
+        heatmap_data = df_copy.pivot_table(index='hour', columns='day', values='src_ip', aggfunc='count')
+        days_order = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
+        heatmap_data = heatmap_data.reindex(columns=days_order)
+        fig = px.imshow(
+            heatmap_data,
+            text_auto=True,
+            aspect="auto",
+            title="Attack Heatmap: Hour vs Day",
+            color_continuous_scale='Reds'
+        )
+        fig.update_layout(height=400)
+        return fig
+    except:
+        return go.Figure()
+
+def create_pie_chart(df):
+    """Display event type distribution."""
+    if df.empty:
+        return go.Figure()
+    try:
+        event_counts = df['eventid'].value_counts().reset_index()
+        event_counts.columns = ['event', 'count']
+        event_counts['event'] = event_counts['event'].map({
+            'cowrie.login.success': 'Successful Login',
+            'cowrie.login.failed': 'Failed Login',
+            'cowrie.command.input': 'Command Execution',
+            'cowrie.session.connect': 'Session Connect',
+            'opencanary.ssh.login.failed': 'SSH Failed',
+            'opencanary.ssh.session.connect': 'SSH Connect',
+            'opencanary.ssh.version.exchange': 'SSH Version',
+            'opencanary.http.request': 'HTTP Request',
+            'opencanary.http.login': 'HTTP Login',
+            'opencanary.ftp.login': 'FTP Login',
+            'opencanary.mysql.login': 'MySQL Login',
+            'opencanary.telnet.login': 'Telnet Login',
+            'opencanary.service.start': 'Service Start',
+        }).fillna('Other')
+        
+        fig = px.pie(
+            event_counts,
+            values='count',
+            names='event',
+            title="Event Type Distribution",
+            color_discrete_sequence=[COLORS["success"], COLORS["danger"], COLORS["secondary"], COLORS["warning"]]
+        )
+        fig.update_layout(height=400)
+        return fig
+    except:
+        return go.Figure()
+
+def create_top_attackers(df):
+    """Display top attacking IP addresses."""
+    if df.empty or 'src_ip' not in df.columns:
+        return go.Figure()
+    try:
+        normal_ips = ["10.10.10.53"]
+        df_filtered = df[~df['src_ip'].isin(normal_ips)]
+        top_attackers = df_filtered['src_ip'].value_counts().head(10).reset_index()
+        top_attackers.columns = ['IP Address', 'Attack Count']
+        fig = px.bar(
+            top_attackers,
+            x='IP Address',
+            y='Attack Count',
+            title="Top 10 Attacking IP Addresses",
+            color='Attack Count',
+            color_continuous_scale='Reds'
+        )
+        fig.update_layout(height=400)
+        return fig
+    except:
+        return go.Figure()
+
+def create_mitre_tactics_chart(df):
+    """Display MITRE ATT&CK tactic distribution."""
+    if df.empty or 'mitre_tactic' not in df.columns:
+        return go.Figure()
+    try:
+        tactic_counts = df[df['mitre_tactic'].notna()]['mitre_tactic'].value_counts().reset_index()
+        if tactic_counts.empty:
+            return go.Figure()
+        tactic_counts.columns = ['Tactic', 'Count']
+        fig = px.bar(
+            tactic_counts,
+            x='Tactic',
+            y='Count',
+            title="MITRE ATT&CK Tactics Distribution",
+            color='Tactic',
+            color_discrete_sequence=px.colors.qualitative.Set2
+        )
+        fig.update_layout(height=400, showlegend=False)
+        return fig
+    except:
+        return go.Figure()
+
+def create_mitre_techniques_chart(df):
+    """Display top MITRE ATT&CK techniques."""
+    if df.empty or 'mitre_id' not in df.columns:
+        return go.Figure()
+    try:
+        mitre_counts = df[df['mitre_id'].notna()].groupby(['mitre_id', 'mitre_name']).size().reset_index(name='count')
+        if mitre_counts.empty:
+            return go.Figure()
+        mitre_counts = mitre_counts.sort_values('count', ascending=False).head(15)
+        mitre_counts['label'] = mitre_counts['mitre_id'] + ' - ' + mitre_counts['mitre_name']
+        fig = px.bar(
+            mitre_counts,
+            y='label',
+            x='count',
+            title="Top 15 MITRE ATT&CK Techniques",
+            color='count',
+            color_continuous_scale='Viridis',
+            orientation='h'
+        )
+        fig.update_layout(height=500)
+        return fig
+    except:
+        return go.Figure()
+
+def create_kill_chain(df):
+    """Visualize detected MITRE ATT&CK kill chain phases."""
+    kill_chain_order = ["Initial Access", "Execution", "Persistence", "Privilege Escalation",
+                        "Defense Evasion", "Credential Access", "Discovery", "Lateral Movement",
+                        "Collection", "Command and Control", "Exfiltration", "Impact"]
+    if df.empty or 'mitre_tactic' not in df.columns:
+        return go.Figure()
+    try:
+        detected_tactics = set(df['mitre_tactic'].dropna().unique())
+        colors = ["#E74C3C" if t in detected_tactics else "#95A5A6" for t in kill_chain_order]
+        values = [1 if t in detected_tactics else 0.3 for t in kill_chain_order]
+        fig = go.Figure()
+        fig.add_trace(go.Bar(x=kill_chain_order, y=values, marker_color=colors))
+        fig.update_layout(
+            title="MITRE ATT&CK Kill Chain - Detected Tactics",
+            height=350,
+            xaxis_tickangle=-45,
+            template="plotly_white"
+        )
+        return fig
+    except:
+        return go.Figure()
+
+def create_mitre_sunburst(df):
+    """Generate hierarchical MITRE technique sunburst chart."""
+    if df.empty or 'mitre_tactic' not in df.columns:
+        return go.Figure()
+    try:
+        mitre_data = df[df['mitre_id'].notna()].groupby(['mitre_tactic', 'mitre_id', 'mitre_name']).size().reset_index(name='count')
+        if mitre_data.empty:
+            return go.Figure()
+        fig = px.sunburst(
+            mitre_data,
+            path=['mitre_tactic', 'mitre_id'],
+            values='count',
+            title="MITRE ATT&CK Technique Hierarchy"
+        )
+        fig.update_layout(height=500)
+        return fig
+    except:
+        return go.Figure()
+
+# ============================================================================
+# User Interface - Sidebar Configuration
+# ============================================================================
+
+with st.sidebar:
+    st.markdown("## Configuration")
+    
+    hours = st.slider("Time Window (Hours)", 1, 168, 24)
+    auto_refresh = st.checkbox("Auto Refresh (30s interval)", value=False)
+
+    st.markdown("---")
+    
+    st.markdown("### Filter by Honeypot")
+    honeypot_filter = st.selectbox(
+        "Select Honeypot Type",
+        options=["All", "Cowrie", "OpenCanary"],
+        index=0
+    )
+
+    st.markdown("---")
+    
+    st.markdown("### MITRE ATT&CK Framework")
+    if st.button("Update MITRE Techniques", use_container_width=True):
+        with st.spinner("Downloading latest MITRE techniques..."):
+            techniques, success = download_mitre_techniques()
+            if success:
+                st.success(f"Updated! {len(techniques)} techniques loaded")
+                st.cache_data.clear()
+                time.sleep(0.5)
+                st.rerun()
+            else:
+                st.error("Failed to update MITRE techniques")
+
+    st.markdown("---")
+    
+    st.markdown("### AI Security Analysis")
+    st.info("Click the analysis button after data loads to receive AI-generated security recommendations.")
+
+    st.markdown("---")
+    
+    st.markdown("### Quick Access")
+    st.markdown("[Kibana Dashboard](http://10.10.10.10:5601)")
+    st.markdown("[Elasticsearch API](http://10.10.10.10:9200)")
+    st.markdown("[MITRE ATT&CK Reference](https://attack.mitre.org/)")
+
+# ============================================================================
+# Main Dashboard Content
+# ============================================================================
+
+with st.spinner("Retrieving security telemetry data..."):
+    df = fetch_logs(hours)
+
+if df.empty:
+    st.warning("No security events found in Elasticsearch!")
+    st.stop()
+
+try:
+    df['timestamp'] = pd.to_datetime(df['timestamp'])
+except:
+    st.error("Error parsing event timestamps")
+    st.stop()
+
+if honeypot_filter == "Cowrie":
+    df = df[df['honeypot_type'] == 'cowrie']
+elif honeypot_filter == "OpenCanary":
+    df = df[df['honeypot_type'] == 'opencanary']
+
+if 'src_ip' in df.columns:
+    df['src_ip'] = df['src_ip'].fillna('Unknown')
+else:
+    df['src_ip'] = 'Unknown'
+
+try:
+    df = add_mitre_to_df(df)
+except Exception as e:
+    st.error(f"MITRE mapping error: {e}")
+    df['mitre_id'] = None
+    df['mitre_name'] = None
+    df['mitre_tactic'] = None
+
+total, success, failed, success_rate, unique_ips = calculate_stats(df)
+
+mitre_detected = df[df['mitre_id'].notna()]
+mitre_count = mitre_detected['mitre_id'].nunique() if not mitre_detected.empty else 0
+mitre_tactics = mitre_detected['mitre_tactic'].nunique() if not mitre_detected.empty else 0
+
+# ============================================================================
+# MITRE Technique Management Interface
+# ============================================================================
+
+with st.expander("MITRE ATT&CK Technique Manager", expanded=False):
+    st.markdown("### Edit MITRE Technique Mappings")
+    st.info("Modify the mapping between commands and MITRE ATT&CK techniques. Changes are saved locally.")
+
+    techniques_list = []
+    for pattern, tech in MITRE_TECHNIQUES.items():
+        techniques_list.append({
+            "Command Pattern": pattern,
+            "MITRE ID": tech.get("id", ""),
+            "Name": tech.get("name", ""),
+            "Tactic": tech.get("tactic", "Discovery")
+        })
+
+    if techniques_list:
+        edited_df = st.data_editor(
+            pd.DataFrame(techniques_list),
+            use_container_width=True,
+            num_rows="dynamic",
+            key="mitre_editor",
+            column_config={
+                "Command Pattern": st.column_config.TextColumn("Command Pattern", width="medium"),
+                "MITRE ID": st.column_config.TextColumn("MITRE ID", width="small"),
+                "Name": st.column_config.TextColumn("Technique Name", width="large"),
+                "Tactic": st.column_config.SelectboxColumn("Tactic", options=[
+                    "Initial Access", "Execution", "Persistence", "Privilege Escalation",
+                    "Defense Evasion", "Credential Access", "Discovery", "Lateral Movement",
+                    "Collection", "Command and Control", "Exfiltration", "Impact"
+                ], width="medium")
+            }
+        )
+
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("Save MITRE Mappings", use_container_width=True):
+                new_techniques = {}
+                for _, row in edited_df.iterrows():
+                    pattern = row.get("Command Pattern")
+                    if pattern and len(str(pattern).strip()) > 0:
+                        new_techniques[str(pattern).strip()] = {
+                            "id": str(row.get("MITRE ID", "")).strip(),
+                            "name": str(row.get("Name", "")).strip(),
+                            "tactic": str(row.get("Tactic", "Discovery")).strip()
+                        }
+                if save_mitre_techniques(new_techniques):
+                    st.success("MITRE mappings saved successfully")
+                    st.cache_data.clear()
+                    time.sleep(1)
+                    st.rerun()
+                else:
+                    st.error("Failed to save MITRE mappings")
+
+        with col2:
+            if st.button("Reload Mappings", use_container_width=True):
+                st.cache_data.clear()
+                st.rerun()
+
+    st.markdown("---")
+    st.markdown("#### Add New Technique Mapping")
+
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        new_pattern = st.text_input("Command Pattern", key="new_pattern")
+    with col2:
+        new_mitre_id = st.text_input("MITRE ID", key="new_mitre_id", placeholder="T1082")
+    with col3:
+        new_name = st.text_input("Technique Name", key="new_name")
+    with col4:
+        new_tactic = st.selectbox("Tactic", [
+            "Discovery", "Persistence", "Defense Evasion", "Privilege Escalation",
+            "Credential Access", "Initial Access", "Execution", "Lateral Movement"
+        ], key="new_tactic")
+
+    if st.button("Add Technique", use_container_width=True):
+        if new_pattern:
+            current = load_mitre_techniques()
+            current[new_pattern] = {
+                "id": new_mitre_id,
+                "name": new_name if new_name else new_pattern,
+                "tactic": new_tactic
+            }
+            if save_mitre_techniques(current):
+                st.success(f"Added technique mapping for '{new_pattern}'")
+                st.cache_data.clear()
+                time.sleep(0.5)
+                st.rerun()
+            else:
+                st.error("Failed to save technique")
+        else:
+            st.warning("Please enter a command pattern")
+
+st.markdown("---")
+
+# ============================================================================
+# Key Metrics Dashboard
+# ============================================================================
+
+st.markdown("### Security Metrics Overview")
+
+col1, col2, col3, col4, col5, col6 = st.columns(6)
+
+with col1:
+    st.metric("Total Events", f"{total:,}")
+with col2:
+    st.metric("Successful Logins", f"{success:,}")
+with col3:
+    st.metric("Failed Attempts", f"{failed:,}")
+with col4:
+    st.metric("Success Rate", f"{success_rate:.1f}%")
+with col5:
+    st.metric("Unique Attackers", f"{unique_ips:,}")
+with col6:
+    st.metric("MITRE Techniques", f"{mitre_count}", delta=f"{mitre_tactics} tactics")
+
+cowrie_count = len(df[df['honeypot_type'] == 'cowrie'])
+opencanary_count = len(df[df['honeypot_type'] == 'opencanary'])
+
+col7, col8 = st.columns(2)
+with col7:
+    st.metric("Cowrie Events", cowrie_count)
+with col8:
+    st.metric("OpenCanary Events", opencanary_count)
+
+st.markdown("---")
+
+# ============================================================================
+# MITRE ATT&CK Visualization Section
+# ============================================================================
+
+st.markdown(f"<h2 style='color: {COLORS['mitre']};'>MITRE ATT&CK Threat Intelligence</h2>", unsafe_allow_html=True)
+
+if not mitre_detected.empty:
+    col1, col2 = st.columns(2)
+    with col1:
+        fig_killchain = create_kill_chain(mitre_detected)
+        st.plotly_chart(fig_killchain, use_container_width=True)
+    with col2:
+        fig_tactics = create_mitre_tactics_chart(mitre_detected)
+        st.plotly_chart(fig_tactics, use_container_width=True)
+
+    col1, col2 = st.columns(2)
+    with col1:
+        fig_techniques = create_mitre_techniques_chart(mitre_detected)
+        st.plotly_chart(fig_techniques, use_container_width=True)
+    with col2:
+        fig_sunburst = create_mitre_sunburst(mitre_detected)
+        st.plotly_chart(fig_sunburst, use_container_width=True)
+
+    st.markdown("### MITRE Technique Summary")
+    try:
+        mitre_summary = mitre_detected.groupby(['mitre_id', 'mitre_name', 'mitre_tactic']).size().reset_index(name='count')
+        mitre_summary = mitre_summary.sort_values('count', ascending=False)
+        mitre_summary['mitre_link'] = mitre_summary['mitre_id'].apply(
+            lambda x: f"https://attack.mitre.org/techniques/{str(x).replace('.', '/')}/" if x else ""
+        )
+        st.dataframe(
+            mitre_summary[['mitre_id', 'mitre_name', 'mitre_tactic', 'count', 'mitre_link']],
+            use_container_width=True,
+            height=300,
+            column_config={"mitre_link": st.column_config.LinkColumn("MITRE Reference")}
+        )
+    except Exception as e:
+        st.error(f"Error displaying MITRE summary: {e}")
+else:
+    st.info("No MITRE ATT&CK techniques detected in the current data window")
+
+st.markdown("---")
+
+# ============================================================================
+# Anomaly Detection & Threat Alerts
+# ============================================================================
+
+st.markdown("### Threat Detection & Anomaly Alerts")
+
+anomalies = detect_anomalies(df)
+if anomalies:
+    with st.expander("Security Alerts", expanded=True):
+        for anomaly in anomalies:
+            st.warning(anomaly)
+else:
+    st.success("No anomalies detected in the current data window")
+
+bf_attempts = detect_brute_force(df)
+if not bf_attempts.empty:
+    with st.expander("Brute Force Detection", expanded=True):
+        st.dataframe(bf_attempts, use_container_width=True)
+
+st.markdown("---")
+
+# ============================================================================
+# AI Security Analysis
+# ============================================================================
+
+col_ai1, col_ai2, col_ai3 = st.columns([1, 2, 1])
+with col_ai2:
+    if st.button("Run AI Security Analysis", use_container_width=True):
+        with st.spinner("AI threat analysis in progress..."):
+            analysis = ai_analyze_logs(df)
+            st.markdown("### AI-Generated Security Recommendations")
+            st.info(analysis)
+
+st.markdown("---")
+
+# ============================================================================
+# Attack Analytics Visualizations
+# ============================================================================
+
+st.markdown("### Attack Pattern Analytics")
+
+col1, col2 = st.columns(2)
+with col1:
+    fig_timeline = create_attack_timeline(df)
+    st.plotly_chart(fig_timeline, use_container_width=True)
+with col2:
+    fig_heatmap = create_attack_heatmap(df)
+    st.plotly_chart(fig_heatmap, use_container_width=True)
+
+col1, col2 = st.columns(2)
+with col1:
+    fig_pie = create_pie_chart(df)
+    st.plotly_chart(fig_pie, use_container_width=True)
+with col2:
+    fig_attackers = create_top_attackers(df)
+    st.plotly_chart(fig_attackers, use_container_width=True)
+
+st.markdown("---")
+
+# ============================================================================
+# Recent Events Table
+# ============================================================================
+
+st.subheader("Recent Security Events with MITRE Mapping")
+
+try:
+    df_display = df.head(50).copy()
+    columns_to_show = ['timestamp', 'src_ip', 'eventid', 'username', 'password', 'command', 'honeypot_type']
+    if 'mitre_id' in df_display.columns:
+        columns_to_show.extend(['mitre_id', 'mitre_tactic'])
+    df_display = df_display[columns_to_show]
+
+    for col in ['username', 'password', 'command']:
+        if col in df_display.columns:
+            df_display[col] = df_display[col].fillna('').astype(str)
+
+    def color_eventid(val):
+        val_str = str(val).lower()
+        if 'success' in val_str:
+            return 'background-color: #5DFFA6'
+        elif 'failed' in val_str or 'attempt' in val_str:
+            return 'background-color: #F25454'
+        elif 'command' in val_str or 'version' in val_str:
+            return 'background-color: #4ECDC4'
+        elif 'connect' in val_str:
+            return 'background-color: #FFE66D'
+        return ''
+
+    eventid_display_map = {
+        'cowrie.login.success': 'SUCCESS',
+        'cowrie.login.failed': 'FAILED',
+        'cowrie.command.input': 'COMMAND',
+        'cowrie.session.connect': 'CONNECT',
+        'opencanary.ssh.login.failed': 'SSH FAILED',
+        'opencanary.ssh.session.connect': 'SSH CONNECT',
+        'opencanary.ssh.version.exchange': 'SSH VERSION',
+        'opencanary.http.request': 'HTTP',
+        'opencanary.http.login': 'HTTP LOGIN',
+        'opencanary.ftp.login': 'FTP LOGIN',
+        'opencanary.mysql.login': 'MYSQL',
+        'opencanary.telnet.login': 'TELNET',
+        'opencanary.service.start': 'SERVICE START',
+    }
+    
+    df_display['eventid_display'] = df_display['eventid'].map(eventid_display_map).fillna(df_display['eventid'])
+    df_display['honeypot_type'] = df_display['honeypot_type'].map({
+        'cowrie': 'Cowrie',
+        'opencanary': 'OpenCanary'
+    }).fillna('Other')
+
+    if 'mitre_id' in df_display.columns:
+        df_display['mitre_id'] = df_display['mitre_id'].fillna('')
+        df_display['mitre_tactic'] = df_display['mitre_tactic'].fillna('')
+
+    display_cols = ['timestamp', 'honeypot_type', 'eventid_display', 'src_ip', 'username', 'password', 'command']
+    if 'mitre_id' in df_display.columns:
+        display_cols.extend(['mitre_id', 'mitre_tactic'])
+    
+    df_display = df_display[display_cols]
+    df_display.columns = ['Timestamp', 'Honeypot', 'Event', 'Source IP', 'Username', 'Password', 'Command'] + \
+                         (['MITRE ID', 'MITRE Tactic'] if 'mitre_id' in df_display.columns else [])
+
+    styled_df = df_display.style.map(color_eventid, subset=['Event'])
+    st.dataframe(styled_df, height=500, use_container_width=True)
+    
+except Exception as e:
+    st.error(f"Error displaying event table: {e}")
+    st.dataframe(df.head(50), height=500, use_container_width=True)
+
+st.markdown("---")
+
+# ============================================================================
+# Statistical Insights
+# ============================================================================
+
+st.subheader("Statistical Insights")
+
+col1, col2, col3 = st.columns(3)
+
+with col1:
+    if 'username' in df.columns and not df['username'].mode().empty:
+        most_attacked_user = df['username'].mode().iloc[0]
+    else:
+        most_attacked_user = "N/A"
+    st.metric("Most Targeted Username", most_attacked_user)
+
+with col2:
+    if 'password' in df.columns and not df['password'].mode().empty:
+        common_password = df['password'].mode().iloc[0]
+    else:
+        common_password = "N/A"
+    st.metric("Most Common Password", common_password)
+
+with col3:
+    if not df.empty:
+        peak_hour = df['timestamp'].dt.hour.value_counts().index[0]
+        st.metric("Peak Attack Hour", f"{peak_hour}:00")
+    else:
+        st.metric("Peak Attack Hour", "N/A")
+
+if not mitre_detected.empty:
+    st.markdown("---")
+    st.subheader("MITRE ATT&CK Statistics")
+    
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        top_mitre = mitre_detected['mitre_id'].mode().iloc[0] if not mitre_detected['mitre_id'].mode().empty else "N/A"
+        st.metric("Most Common Technique", top_mitre)
+    with col2:
+        top_tactic = mitre_detected['mitre_tactic'].mode().iloc[0] if not mitre_detected['mitre_tactic'].mode().empty else "N/A"
+        st.metric("Most Common Tactic", top_tactic)
+    with col3:
+        mapped_pct = (len(mitre_detected) / len(df)) * 100 if len(df) > 0 else 0
+        st.metric("MITRE Coverage", f"{mapped_pct:.1f}%")
+
+# ============================================================================
+# OpenCanary Detailed Analysis
+# ============================================================================
+
+opencanary_df = df[df['honeypot_type'] == 'opencanary']
+if not opencanary_df.empty:
+    st.markdown("---")
+    st.subheader("OpenCanary Service Analysis")
+    
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        ssh_attempts = len(opencanary_df[opencanary_df['eventid'].str.contains('ssh', case=False, na=False)])
+        st.metric("SSH Service Attacks", ssh_attempts)
+    with col2:
+        http_attempts = len(opencanary_df[opencanary_df['eventid'].str.contains('http', case=False, na=False)])
+        st.metric("HTTP Service Attacks", http_attempts)
+    with col3:
+        other_attempts = len(opencanary_df) - ssh_attempts - http_attempts
+        st.metric("Other Service Attacks", other_attempts)
+    
+    st.markdown("### OpenCanary Credential Harvesting")
+    creds_df = opencanary_df[opencanary_df['username'] != ''][['timestamp', 'src_ip', 'eventid', 'username', 'password']].head(20)
+    if not creds_df.empty:
+        st.dataframe(creds_df, use_container_width=True)
+    else:
+        st.info("No credential harvesting attempts detected in OpenCanary data")
+
+# ============================================================================
+# Auto-Refresh Handler
+# ============================================================================
+
+if auto_refresh:
+    time.sleep(30)
+    st.rerun()

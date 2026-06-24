@@ -1,0 +1,423 @@
+#!/usr/bin/env python3
+"""
+================================================================================
+TRAINING PIPELINE: Honeypot Attack Detection Models
+================================================================================
+Models: XGBoost, LSTM, CNN
+Dataset: OpenCanary Honeypot Logs
+Purpose: Binary classification of network attacks vs normal traffic
+================================================================================
+"""
+
+import pandas as pd
+import numpy as np
+import pickle
+import json
+import warnings
+from datetime import datetime
+
+from sklearn.model_selection import train_test_split, StratifiedKFold, cross_val_score
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import classification_report, confusion_matrix, accuracy_score, roc_auc_score
+
+import xgboost as xgb
+
+import tensorflow as tf
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense, Dropout, Conv1D, MaxPooling1D, Flatten, BatchNormalization
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
+from tensorflow.keras.optimizers import Adam
+
+warnings.filterwarnings('ignore')
+tf.get_logger().setLevel('ERROR')
+
+# =================================================================================
+# CONFIGURATION
+# =================================================================================
+RANDOM_STATE = 42
+TEST_SIZE = 0.2
+VALIDATION_SPLIT = 0.2
+EPOCHS = 50
+BATCH_SIZE = 16
+EARLY_STOPPING_PATIENCE = 10
+REDUCE_LR_PATIENCE = 5
+
+# =================================================================================
+# 1. DATA LOADING
+# =================================================================================
+print("=" * 70)
+print("  HONEYPOT ML TRAINING PIPELINE")
+print("=" * 70)
+print(f"  Started at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+print("=" * 70)
+
+try:
+    df = pd.read_csv("honeypot_features.csv")
+    print(f"\n[✓] Data loaded successfully")
+    print(f"    Records: {len(df)}")
+    print(f"    Features: {len(df.columns) - 1}")
+except FileNotFoundError:
+    print("\n[✗] ERROR: File 'honeypot_features.csv' not found")
+    print("    Run extract_features.py first to generate features")
+    exit(1)
+
+# =================================================================================
+# 2. FEATURE DEFINITION
+# =================================================================================
+FEATURE_COLUMNS = [
+    'hour',                 # Hour of day (0-23)
+    'day_of_week',          # Day of week (0-6)
+    'pwd_length',           # Password string length
+    'user_length',          # Username string length
+    'pwd_has_digit',        # Password contains digit (0/1)
+    'pwd_has_upper',        # Password contains uppercase (0/1)
+    'pwd_has_special',      # Password contains special char (0/1)
+    'pwd_is_common',        # Password is in common list (0/1)
+    'user_is_common',       # Username is in common list (0/1)
+    'src_ip_class'          # IP class: 0=private, 1=public, 2=other
+]
+
+X = df[FEATURE_COLUMNS].copy()
+y = df['target'].copy()
+
+print(f"\n[✓] Feature matrix:")
+print(f"    Features: {len(FEATURE_COLUMNS)}")
+print(f"    Target classes:")
+print(f"    - Normal (0): {(y == 0).sum()}")
+print(f"    - Attack (1): {(y == 1).sum()}")
+print(f"    - Attack ratio: {y.sum() / len(y) * 100:.2f}%")
+
+# =================================================================================
+# 3. DATA SPLITTING (Stratified to maintain class distribution)
+# =================================================================================
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y,
+    test_size=TEST_SIZE,
+    random_state=RANDOM_STATE,
+    stratify=y
+)
+
+print(f"\n[✓] Data split completed:")
+print(f"    Training set: {len(X_train)} samples")
+print(f"    Test set: {len(X_test)} samples")
+
+# =================================================================================
+# 4. FEATURE SCALING
+# =================================================================================
+scaler = StandardScaler()
+X_train_scaled = scaler.fit_transform(X_train)
+X_test_scaled = scaler.transform(X_test)
+
+# Persist scaler for real-time inference
+with open("honeypot_scaler.pkl", "wb") as f:
+    pickle.dump(scaler, f)
+print(f"\n[✓] Scaler saved: honeypot_scaler.pkl")
+
+# Reshape for sequential models (LSTM/CNN require 3D input)
+X_train_seq = X_train_scaled.reshape(X_train_scaled.shape[0], 1, X_train_scaled.shape[1])
+X_test_seq = X_test_scaled.reshape(X_test_scaled.shape[0], 1, X_test_scaled.shape[1])
+
+# =================================================================================
+# 5. MODEL 1: XGBOOST
+# =================================================================================
+print("\n" + "=" * 70)
+print("  [1/3] TRAINING XGBOOST CLASSIFIER")
+print("=" * 70)
+
+xgb_model = xgb.XGBClassifier(
+    n_estimators=200,
+    max_depth=8,
+    learning_rate=0.1,
+    subsample=0.8,
+    colsample_bytree=0.8,
+    min_child_weight=1,
+    gamma=0,
+    reg_alpha=0.1,
+    reg_lambda=0.1,
+    random_state=RANDOM_STATE,
+    use_label_encoder=False,
+    eval_metric='logloss',
+    n_jobs=-1
+)
+
+# Training with early stopping via cross-validation
+eval_set = [(X_train, y_train), (X_test, y_test)]
+xgb_model.fit(
+    X_train, y_train,
+    eval_set=eval_set,
+    verbose=False
+)
+
+# Evaluation
+y_pred_xgb = xgb_model.predict(X_test)
+y_proba_xgb = xgb_model.predict_proba(X_test)[:, 1]
+acc_xgb = accuracy_score(y_test, y_pred_xgb)
+auc_xgb = roc_auc_score(y_test, y_proba_xgb)
+
+print(f"\n[✓] XGBoost Results:")
+print(f"    Accuracy: {acc_xgb:.4f}")
+print(f"    AUC-ROC:  {auc_xgb:.4f}")
+print("\nClassification Report:")
+print(classification_report(y_test, y_pred_xgb, target_names=['Normal', 'Attack']))
+
+# Feature importance analysis
+feature_importance = pd.DataFrame({
+    'feature': FEATURE_COLUMNS,
+    'importance': xgb_model.feature_importances_
+}).sort_values('importance', ascending=False)
+
+print("\nTop 5 Important Features:")
+print(feature_importance.head(5).to_string(index=False))
+
+# Save model
+xgb_model.save_model("honeypot_xgb.json")
+print("\n[✓] Model saved: honeypot_xgb.json")
+
+# =================================================================================
+# 6. MODEL 2: LSTM (Long Short-Term Memory)
+# =================================================================================
+print("\n" + "=" * 70)
+print("  [2/3] TRAINING LSTM NETWORK")
+print("=" * 70)
+
+lstm_model = Sequential([
+    LSTM(128, return_sequences=True, input_shape=(1, len(FEATURE_COLUMNS))),
+    BatchNormalization(),
+    Dropout(0.3),
+    
+    LSTM(64, return_sequences=True),
+    BatchNormalization(),
+    Dropout(0.3),
+    
+    LSTM(32),
+    BatchNormalization(),
+    Dropout(0.2),
+    
+    Dense(16, activation='relu'),
+    Dropout(0.2),
+    Dense(1, activation='sigmoid')
+])
+
+lstm_model.compile(
+    optimizer=Adam(learning_rate=0.001),
+    loss='binary_crossentropy',
+    metrics=['accuracy']
+)
+
+# Callbacks
+callbacks = [
+    EarlyStopping(monitor='val_loss', patience=EARLY_STOPPING_PATIENCE, restore_best_weights=True),
+    ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=REDUCE_LR_PATIENCE, min_lr=1e-6)
+]
+
+# Training
+history_lstm = lstm_model.fit(
+    X_train_seq, y_train,
+    epochs=EPOCHS,
+    batch_size=BATCH_SIZE,
+    validation_split=VALIDATION_SPLIT,
+    callbacks=callbacks,
+    verbose=1
+)
+
+# Evaluation
+loss_lstm, acc_lstm = lstm_model.evaluate(X_test_seq, y_test, verbose=0)
+y_proba_lstm = lstm_model.predict(X_test_seq, verbose=0).flatten()
+y_pred_lstm = (y_proba_lstm > 0.5).astype(int)
+auc_lstm = roc_auc_score(y_test, y_proba_lstm)
+
+print(f"\n[✓] LSTM Results:")
+print(f"    Accuracy: {acc_lstm:.4f}")
+print(f"    AUC-ROC:  {auc_lstm:.4f}")
+
+# Save model (Keras format recommended)
+lstm_model.save("honeypot_lstm.keras")
+print("\n[✓] Model saved: honeypot_lstm.keras")
+
+# =================================================================================
+# 7. MODEL 3: CNN (Convolutional Neural Network)
+# =================================================================================
+print("\n" + "=" * 70)
+print("  [3/3] TRAINING CNN NETWORK")
+print("=" * 70)
+
+cnn_model = Sequential([
+    Conv1D(128, kernel_size=1, activation='relu', input_shape=(1, len(FEATURE_COLUMNS))),
+    BatchNormalization(),
+    MaxPooling1D(pool_size=1),
+    Dropout(0.3),
+    
+    Conv1D(64, kernel_size=1, activation='relu'),
+    BatchNormalization(),
+    MaxPooling1D(pool_size=1),
+    Dropout(0.3),
+    
+    Conv1D(32, kernel_size=1, activation='relu'),
+    BatchNormalization(),
+    Flatten(),
+    
+    Dense(64, activation='relu'),
+    Dropout(0.3),
+    Dense(32, activation='relu'),
+    Dropout(0.2),
+    Dense(1, activation='sigmoid')
+])
+
+cnn_model.compile(
+    optimizer=Adam(learning_rate=0.001),
+    loss='binary_crossentropy',
+    metrics=['accuracy']
+)
+
+# Training
+history_cnn = cnn_model.fit(
+    X_train_seq, y_train,
+    epochs=EPOCHS,
+    batch_size=BATCH_SIZE,
+    validation_split=VALIDATION_SPLIT,
+    callbacks=callbacks,
+    verbose=1
+)
+
+# Evaluation
+loss_cnn, acc_cnn = cnn_model.evaluate(X_test_seq, y_test, verbose=0)
+y_proba_cnn = cnn_model.predict(X_test_seq, verbose=0).flatten()
+y_pred_cnn = (y_proba_cnn > 0.5).astype(int)
+auc_cnn = roc_auc_score(y_test, y_proba_cnn)
+
+print(f"\n[✓] CNN Results:")
+print(f"    Accuracy: {acc_cnn:.4f}")
+print(f"    AUC-ROC:  {auc_cnn:.4f}")
+
+# Save model
+cnn_model.save("honeypot_cnn.keras")
+print("\n[✓] Model saved: honeypot_cnn.keras")
+
+# =================================================================================
+# 8. MODEL COMPARISON
+# =================================================================================
+print("\n" + "=" * 70)
+print("  MODEL COMPARISON SUMMARY")
+print("=" * 70)
+
+comparison_df = pd.DataFrame({
+    'Model': ['XGBoost', 'LSTM', 'CNN'],
+    'Accuracy': [acc_xgb, acc_lstm, acc_cnn],
+    'AUC-ROC': [auc_xgb, auc_lstm, auc_cnn],
+    'Inference Speed': ['Fast', 'Medium', 'Medium'],
+    'Memory Usage': ['Low', 'High', 'Medium']
+})
+
+best_idx = comparison_df['Accuracy'].idxmax()
+comparison_df['Rank'] = comparison_df['Accuracy'].rank(ascending=False, method='dense').astype(int)
+comparison_df.loc[best_idx, 'Best'] = '🏆'
+
+print(comparison_df.to_string(index=False))
+
+# =================================================================================
+# 9. CONFUSION MATRICES
+# =================================================================================
+print("\n" + "=" * 70)
+print("  CONFUSION MATRICES")
+print("=" * 70)
+
+models = [
+    ('XGBoost', y_pred_xgb),
+    ('LSTM', y_pred_lstm),
+    ('CNN', y_pred_cnn)
+]
+
+for name, pred in models:
+    cm = confusion_matrix(y_test, pred)
+    print(f"\n{name}:")
+    print("    TN: {:4d}  FP: {:4d}".format(cm[0,0], cm[0,1]))
+    print("    FN: {:4d}  TP: {:4d}".format(cm[1,0], cm[1,1]))
+
+# =================================================================================
+# 10. SAVE METADATA
+# =================================================================================
+metadata = {
+    'training_timestamp': datetime.now().isoformat(),
+    'dataset_size': len(df),
+    'attack_ratio': float(y.sum() / len(y)),
+    'features': FEATURE_COLUMNS,
+    'train_size': len(X_train),
+    'test_size': len(X_test),
+    'random_state': RANDOM_STATE,
+    'xgboost': {
+        'accuracy': float(acc_xgb),
+        'auc_roc': float(auc_xgb),
+        'feature_importance': feature_importance.to_dict('records')
+    },
+    'lstm': {
+        'accuracy': float(acc_lstm),
+        'auc_roc': float(auc_lstm),
+        'epochs': len(history_lstm.history['loss'])
+    },
+    'cnn': {
+        'accuracy': float(acc_cnn),
+        'auc_roc': float(auc_cnn),
+        'epochs': len(history_cnn.history['loss'])
+    },
+    'best_model': comparison_df.loc[best_idx, 'Model']
+}
+
+with open("model_metadata.json", "w") as f:
+    json.dump(metadata, f, indent=2)
+
+print("\n[✓] Metadata saved: model_metadata.json")
+
+# =================================================================================
+# 11. FINAL SUMMARY
+# =================================================================================
+print("\n" + "=" * 70)
+print("  ✅ TRAINING COMPLETE")
+print("=" * 70)
+
+print("\n📁 Generated Files:")
+print("   ├── honeypot_xgb.json          # XGBoost model (JSON)")
+print("   ├── honeypot_lstm.keras        # LSTM model (Keras)")
+print("   ├── honeypot_cnn.keras         # CNN model (Keras)")
+print("   ├── honeypot_scaler.pkl        # Feature scaler (Pickle)")
+print("   └── model_metadata.json        # Training metadata")
+
+print(f"\n📊 Best Performing Model: {comparison_df.loc[best_idx, 'Model']}")
+print(f"   Accuracy: {comparison_df.loc[best_idx, 'Accuracy']:.4f}")
+
+# =================================================================================
+# 12. RAPID TEST PREDICTION
+# =================================================================================
+print("\n" + "=" * 70)
+print("  SAMPLE PREDICTION TEST")
+print("=" * 70)
+
+sample = X_test.iloc[0:1]
+sample_scaled = scaler.transform(sample)
+sample_seq = sample_scaled.reshape(1, 1, len(FEATURE_COLUMNS))
+
+# XGBoost
+xgb_pred = xgb_model.predict(sample)[0]
+xgb_proba = xgb_model.predict_proba(sample)[0][1]
+
+# LSTM
+lstm_proba = lstm_model.predict(sample_seq, verbose=0)[0][0]
+lstm_pred = 1 if lstm_proba > 0.5 else 0
+
+# CNN
+cnn_proba = cnn_model.predict(sample_seq, verbose=0)[0][0]
+cnn_pred = 1 if cnn_proba > 0.5 else 0
+
+print("\nSample Prediction Results:")
+print(f"  ┌─────────────────┬─────────────┬─────────────┐")
+print(f"  │ Model           │ Prediction  │ Confidence  │")
+print(f"  ├─────────────────┼─────────────┼─────────────┤")
+print(f"  │ XGBoost         │ {'Attack' if xgb_pred == 1 else 'Normal':<11} │ {xgb_proba:.3f}      │")
+print(f"  │ LSTM            │ {'Attack' if lstm_pred == 1 else 'Normal':<11} │ {lstm_proba:.3f}      │")
+print(f"  │ CNN             │ {'Attack' if cnn_pred == 1 else 'Normal':<11} │ {cnn_proba:.3f}      │")
+print(f"  └─────────────────┴─────────────┴─────────────┘")
+
+print("\n" + "=" * 70)
+print("  Next Steps:")
+print("  1. Run 'python live_prediction.py' for real-time attack detection")
+print("  2. Run 'streamlit run dashboard.py' to visualize results")
+print("=" * 70)
